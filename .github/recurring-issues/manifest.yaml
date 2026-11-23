@@ -1,0 +1,36 @@
+---
+# Recurring helpdesk issues, opened automatically.
+#
+# Two trigger classes:
+#   kind: time     once per period, for rotations and reviews
+#   kind: version  when a version in someone else's repository moves
+#
+# Every entry needs a dedupe_marker. It is written into the issue body as an
+# HTML comment and searched before creating, so a re-run or an overlapping run
+# cannot open a second copy. Placeholders available: {{version}} for version
+# entries, {{period}} and {{since}} for time entries, {{id}} for both.
+
+entries:
+  - id: maven-tool-upgrade
+    kind: version
+    enabled: true
+    title: "Maven {{version}} upgrade campaign"
+    body_template: .github/recurring-issues/templates/tool-upgrade-campaign.md
+    labels:
+      - triage
+    source:
+      # packer-images tracks this exact line, so it is the real start of the campaign
+      url: https://raw.githubusercontent.com/jenkinsci/acceptance-test-harness/master/src/main/resources/ath-container/Dockerfile
+      pattern: '^ARG MAVEN_VERSION=(.+)$'
+    dedupe_marker: "recurring-issue:{{id}}:{{version}}"
+
+  - id: netlify-token-rotation
+    kind: time
+    enabled: true
+    every_days: 90
+    anchor: "2026-01-05T00:00:00Z"
+    title: "Rotate the Netlify token (period {{period}}, from {{since}})"
+    body_template: .github/recurring-issues/templates/credential-rotation.md
+    labels:
+      - triage
+    dedupe_marker: "recurring-issue:{{id}}:{{period}}"

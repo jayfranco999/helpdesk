@@ -1,0 +1,110 @@
+---
+name: "Recurring issues"
+
+# Opens tracking issues automatically, for two classes of trigger:
+#   time    a credential rotation or review that comes round every N days
+#   version a tool version moving in someone else's repository
+#
+# The decision logic lives in .github/recurring-issues/engine.js so it can be
+# unit tested outside Actions. This workflow only supplies the real API calls.
+#
+# Runs in dry run mode by default when triggered by hand, so it can be
+# inspected before it is allowed to create anything.
+
+on:
+  schedule:
+    # 07:15 UTC daily. Cheap, and the dedupe marker makes extra runs harmless.
+    - cron: '15 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report what would be created'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  recurring-issues:
+    name: "Open any due recurring issues"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: "Check out"
+        uses: actions/checkout@v5
+
+      - name: "Convert the manifest to JSON"
+        id: manifest
+        # github-script bundles no YAML parser, and python3 is already on the
+        # runner, so this avoids pulling an npm dependency in just for this.
+        run: |
+          python3 -c "import yaml,json,sys; json.dump(yaml.safe_load(open('.github/recurring-issues/manifest.yaml')), sys.stdout)" > manifest.json
+          echo "entries=$(python3 -c "import json; print(len(json.load(open('manifest.json'))['entries']))")" >> "$GITHUB_OUTPUT"
+
+      - name: "Plan and create"
+        uses: actions/github-script@v9
+        env:
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          ENTRY_COUNT: ${{ steps.manifest.outputs.entries }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { plan } = require(path.join(process.env.GITHUB_WORKSPACE, '.github/recurring-issues/engine.js'));
+
+            const dryRun = process.env.DRY_RUN === 'true';
+            const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+            core.info(`${process.env.ENTRY_COUNT} entries in the manifest, dryRun=${dryRun}`);
+
+            const result = await plan({
+              entries: manifest.entries,
+              now: Date.now(),
+
+              fetchText: async (url) => {
+                const res = await fetch(url);
+                if (!res.ok) return null;
+                return await res.text();
+              },
+
+              // Searches open AND closed. A closed rotation issue means the work
+              // was done, so re-opening a duplicate would just be noise.
+              findByMarker: async (marker) => {
+                const q = `repo:${context.repo.owner}/${context.repo.repo} in:body "${marker}"`;
+                const res = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
+                return res.data.total_count > 0;
+              },
+
+              readTemplate: async (p) => fs.readFileSync(p, 'utf8'),
+            });
+
+            for (const s of result.skip)   core.info(`skip   ${s.id}: ${s.reason}`);
+            for (const c of result.create) core.info(`create ${c.id}: ${c.title}`);
+
+            if (!dryRun) {
+              for (const c of result.create) {
+                const issue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: c.title,
+                  body: c.body,
+                  labels: c.labels,
+                });
+                core.info(`opened #${issue.data.number} for ${c.id}`);
+              }
+            } else if (result.create.length > 0) {
+              core.summary.addHeading('Would open', 3);
+              core.summary.addList(result.create.map((c) => c.title));
+              await core.summary.write();
+            }
+
+            // Fail the run on a broken entry. A manifest entry that silently
+            // reads nothing looks exactly like "nothing was due", which would
+            // hide a moved file or a changed line format indefinitely.
+            if (result.errors.length > 0) {
+              for (const e of result.errors) core.error(`${e.id}: ${e.reason}`);
+              core.setFailed(`${result.errors.length} manifest entr(ies) could not be evaluated`);
+            }
